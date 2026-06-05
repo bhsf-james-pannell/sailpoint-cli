@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,78 @@ type CCG struct {
 	Region                    string    `json:"region"`
 	Queue                     string    `json:"queue"`
 	SCIMCommon                string    `json:"SCIM Common"`
+	Application               string    `json:"Application"`
+	AppType                   string    `json:"AppType"`
+}
+
+// ccgMeta is a lenient subset of a CCG log line containing only the fields
+// needed to classify and route it. Parsing into this (instead of the full CCG
+// struct) avoids dropping lines whose JSON shape doesn't match CCG exactly —
+// notably error lines where "exception" is an object, not a string.
+type ccgMeta struct {
+	Org         string    `json:"org"`
+	Level       string    `json:"level"`
+	LoggerName  string    `json:"logger_name"`
+	Application string    `json:"Application"`
+	Timestamp   time.Time `json:"@timestamp"`
+}
+
+// Summary accumulates ERROR-level counts for the optional --summary rollup.
+// It is written from the single-reader loop and the worker pool, so it is
+// guarded by a mutex.
+type Summary struct {
+	mu       sync.Mutex
+	byLogger map[string]int
+	byApp    map[string]int
+	total    int
+}
+
+func newSummary() *Summary {
+	return &Summary{byLogger: map[string]int{}, byApp: map[string]int{}}
+}
+
+func (s *Summary) add(logger, app string) {
+	if logger == "" {
+		logger = "-"
+	}
+	if app == "" {
+		app = "-"
+	}
+	s.mu.Lock()
+	s.byLogger[logger]++
+	s.byApp[app]++
+	s.total++
+	s.mu.Unlock()
+}
+
+func printSummary(s *Summary) {
+	type kv struct {
+		k string
+		v int
+	}
+	sortDesc := func(m map[string]int) []kv {
+		out := make([]kv, 0, len(m))
+		for k, v := range m {
+			out = append(out, kv{k, v})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].v != out[j].v {
+				return out[i].v > out[j].v
+			}
+			return out[i].k < out[j].k
+		})
+		return out
+	}
+
+	fmt.Fprintf(os.Stdout, "\nERROR summary — %d total\n", s.total)
+	fmt.Fprintln(os.Stdout, "\nBy connector (logger_name):")
+	for _, e := range sortDesc(s.byLogger) {
+		fmt.Fprintf(os.Stdout, "  %6d  %s\n", e.v, e.k)
+	}
+	fmt.Fprintln(os.Stdout, "\nBy application:")
+	for _, e := range sortDesc(s.byApp) {
+		fmt.Fprintf(os.Stdout, "  %6d  %s\n", e.v, e.k)
+	}
 }
 
 var cache = make(map[string]*os.File)
@@ -116,13 +189,16 @@ func saveCanalLine(bytes []byte, dir string) {
 	}
 }
 
-func saveCCGLine(line CCG, dir string, isErr bool) error {
+func saveCCGLine(meta ccgMeta, token []byte, dir string, isErr bool) error {
 	folder := "Standard"
 	if isErr {
 		folder = "Errors"
 	}
-	filename := path.Join(dir, line.Org, folder, line.Timestamp.Format("2006-01-02"), strings.ReplaceAll(line.Logger_name, ".", "-"), "log.json")
-	jsonBytes, _ := json.MarshalIndent(line, "", " ")
+	logger := meta.LoggerName
+	if logger == "" {
+		logger = "unknown"
+	}
+	filename := path.Join(dir, meta.Org, folder, meta.Timestamp.Format("2006-01-02"), strings.ReplaceAll(logger, ".", "-"), "log.json")
 
 	cacheLock.Lock()
 	defer cacheLock.Unlock()
@@ -131,20 +207,26 @@ func saveCCGLine(line CCG, dir string, isErr bool) error {
 	if !exists {
 		tempdir, _ := path.Split(filename)
 		if _, err := os.Stat(tempdir); errors.Is(err, os.ErrNotExist) {
-			err := os.MkdirAll(tempdir, 0700)
-			if err != nil {
+			if err := os.MkdirAll(tempdir, 0700); err != nil {
 				log.Error(err)
 			}
 		}
-		f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		nf, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return err
 		}
-		cache[filename] = f
+		cache[filename] = nf
+		f = nf
 	}
 
-	if _, writeErr := f.Write(jsonBytes); writeErr != nil {
-		return writeErr
+	// Write the raw original JSON line (lossless), newline-terminated -> JSONL.
+	if _, err := f.Write(token); err != nil {
+		return err
+	}
+	if n := len(token); n == 0 || token[n-1] != '\n' {
+		if _, err := f.Write([]byte("\n")); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -170,13 +252,24 @@ func ParseJSON(str string) []byte {
 	return nil
 }
 
+// ErrorCheck is the legacy substring heuristic (kept for reference / canal use).
+// CCG parsing now classifies errors using the structured "level" field instead,
+// because a raw substring scan both misses real ERROR events whose message lacks
+// the words "error"/"exception" and false-positives INFO/WARN lines that contain
+// them.
 func ErrorCheck(token []byte) bool {
 	errorString := []byte("error")
 	exceptionString := []byte("exception")
 	return bytes.Contains(token, errorString) || bytes.Contains(token, exceptionString)
 }
 
-func ParseCCGFile(p *mpb.Progress, filepath string, all bool) error {
+// isErrorLevel reports whether a CCG log line is an error, using the structured
+// JSON "level" field (case-insensitive) rather than a substring scan.
+func isErrorLevel(level string) bool {
+	return strings.EqualFold(level, "ERROR")
+}
+
+func ParseCCGFile(p *mpb.Progress, filepath string, all bool, sum *Summary) error {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return err
@@ -209,9 +302,10 @@ func ParseCCGFile(p *mpb.Progress, filepath string, all bool) error {
 	bufReader := bufio.NewReader(proxyReader)
 
 	type task struct {
-		line  CCG
+		meta  ccgMeta
 		token []byte
 		dir   string
+		isErr bool
 	}
 
 	taskChan := make(chan task)
@@ -222,27 +316,40 @@ func ParseCCGFile(p *mpb.Progress, filepath string, all bool) error {
 		go func() {
 			defer wg.Done()
 			for t := range taskChan {
-				saveCCGLine(t.line, t.dir, ErrorCheck(t.token))
+				if err := saveCCGLine(t.meta, t.token, t.dir, t.isErr); err != nil {
+					log.Error("Issue writing parsed line", "error", err)
+				}
 			}
 		}()
 	}
 
 	for {
-		token, err := bufReader.ReadBytes('\n')
-		if err != nil {
-			break
-		} else {
-			if ErrorCheck(token) || all {
-				var line CCG
-				unErr := json.Unmarshal(token, &line)
-				if unErr == nil && line.Org != "" {
+		token, readErr := bufReader.ReadBytes('\n')
+		// Process the token before acting on readErr so the final line (which may
+		// lack a trailing newline) is not dropped. bufio.ReadBytes returns a fresh
+		// slice each call, so passing it to the channel is safe.
+		if len(token) > 0 {
+			var meta ccgMeta
+			// Parse only the routing fields; lines whose full shape doesn't match
+			// the legacy CCG struct (e.g. "exception" as an object) are no longer
+			// dropped, because we don't unmarshal into that struct anymore.
+			if json.Unmarshal(token, &meta) == nil && meta.Org != "" {
+				isErr := isErrorLevel(meta.Level)
+				if isErr || all {
+					if isErr && sum != nil {
+						sum.add(meta.LoggerName, meta.Application)
+					}
 					taskChan <- task{
-						line:  line,
+						meta:  meta,
 						token: token,
 						dir:   dir,
+						isErr: isErr,
 					}
 				}
 			}
+		}
+		if readErr != nil {
+			break
 		}
 	}
 	close(taskChan)
@@ -327,6 +434,7 @@ func newParseCommand() *cobra.Command {
 	help := util.ParseHelp(parseHelp)
 	var fileType string
 	var all bool
+	var summary bool
 	cmd := &cobra.Command{
 		Use:     "parse",
 		Short:   "Parse log files from SailPoint virtual appliances",
@@ -347,6 +455,11 @@ func newParseCommand() *cobra.Command {
 
 				log.Info("Parsing log files", "files", args)
 
+				var sum *Summary
+				if summary {
+					sum = newSummary()
+				}
+
 				log.SetOutput(p)
 				for _, filepath := range args {
 					wg.Add(1)
@@ -355,7 +468,7 @@ func newParseCommand() *cobra.Command {
 					case "ccg":
 						go func(filepath string) {
 							defer wg.Done()
-							err := ParseCCGFile(p, filepath, all)
+							err := ParseCCGFile(p, filepath, all, sum)
 							if err != nil {
 								log.Error("Issue Parsing log file", "file", filepath, "error", err)
 							}
@@ -373,6 +486,10 @@ func newParseCommand() *cobra.Command {
 				}
 
 				wg.Wait()
+
+				if sum != nil {
+					printSummary(sum)
+				}
 			} else {
 				cmd.Help()
 			}
@@ -383,6 +500,7 @@ func newParseCommand() *cobra.Command {
 
 	cmd.Flags().StringVarP(&fileType, "type", "t", "", "Specifies the log type to parse (ccg, canal)")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "Specifies that all log traffic should be parsed, not just errors")
+	cmd.Flags().BoolVar(&summary, "summary", false, "Print a per-connector / per-application ERROR rollup to stdout (ccg only)")
 
 	return cmd
 }
